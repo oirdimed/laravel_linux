@@ -995,22 +995,10 @@ This makes compatibility issues easier to reproduce and fix.
 
 ---
 
-# License
-
-Choose and add the license you want to use for this project.
-
-For example:
-
-```text
-MIT License
-```
-
----
-
 # Quick Start
 
 ```bash
-git clone https://github.com/YOUR-USERNAME/YOUR-REPOSITORY.git
+git@github.com:oirdimed/laravel_linux.git
 cd YOUR-REPOSITORY
 chmod +x add-laravel-project.sh
 sudo ./add-laravel-project.sh
