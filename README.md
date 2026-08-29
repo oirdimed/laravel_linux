@@ -1,4 +1,4 @@
-# Laravel Project Setup Script
+# [Laravel](https://laravel.com)  Project Setup Script
 
 A Bash script that automates the creation and configuration of **Laravel applications on Debian and Ubuntu**.
 
@@ -1043,3 +1043,4 @@ Permissions
 The goal is simple:
 
 > **Create a new Laravel development environment with one guided command, without repeating the same Linux configuration work for every project.**
+> 
