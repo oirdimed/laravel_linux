@@ -680,13 +680,13 @@ Sensitive information such as database passwords should **never** be written to 
 Clone the repository:
 
 ```bash
-git clone https://github.com/YOUR-USERNAME/YOUR-REPOSITORY.git
+git clone https://github.com/oirdimed/laravel_linux.git
 ```
 
 Enter the directory:
 
 ```bash
-cd YOUR-REPOSITORY
+cd laravel_linux
 ```
 
 ---
