@@ -1004,6 +1004,38 @@ This script brings those operations together into a single guided workflow while
 
 The goal is **not** to hide what happens on the system, but to make the process repeatable, safer, and easier to audit.
 
+---
+
+# Before installing it
+
+
+If you have previous any file , I recommend replacing it completely rather than editing it.
+
+After saving the code, run:
+
+```bash
+bash sudo sed -i 's/\r$//' ~/applications/add-laravel-project.sh && chmod +x ~/applications/add-laravel-project.sh && bash -n ~/applications/add-laravel-project.sh && echo "SYNTAX OK"
+```
+
+Then install it:
+
+```bash
+bash sudo cp ~/applications/add-laravel-project.sh /usr/local/bin/add-laravel-project && sudo chmod 755 /usr/local/bin/add-laravel-project && sudo bash -n /usr/local/bin/add-laravel-project && echo "INSTALLED OK"
+```
+
+Then first test without changing anything:
+
+```bash
+bash add-laravel-project --dry-run
+```
+
+And when that looks good:
+
+```bash
+bash sudo add-laravel-project
+```
+
+NB : the script intentionally treats Vemto as a directory-preparation mode, because Vemto itself is responsible for generating the Laravel application. It does not pretend an empty Vemto directory is already a complete Laravel application.
 
 ---
 
