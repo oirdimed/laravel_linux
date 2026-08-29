@@ -14,7 +14,7 @@ It is designed for developers who work with multiple Laravel projects and want a
 * Dedicated database users
 * Correct Laravel permissions
 * Normal Laravel projects
-* Vemto-generated Laravel projects
+*  [Vemto-generated](https://vemto.app)  Laravel projects
 
 The script is interactive and dynamically adapts to the software installed on the machine.
 
