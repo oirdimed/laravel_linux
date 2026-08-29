@@ -1,66 +1,83 @@
+```bash
 #!/usr/bin/env bash
-
-# ============================================================
+#
 # add-laravel-project.sh
 #
-# Laravel/Vemto project creator for Debian/Ubuntu
+# Creates and configures a Laravel/Vemto project on Debian/Ubuntu.
 #
 # Features:
-#   - Dynamic PHP CLI/FPM detection
-#   - Installs PHP if missing
-#   - Installs missing PHP-FPM when necessary
-#   - Dynamic PHP/Laravel compatibility selection
-#   - Normal Laravel project via Composer
-#   - Vemto project preparation
-#   - Dynamic project directory
-#   - MySQL database + dedicated user
-#   - Apache .test virtual host
-#   - Per-project PHP-FPM
-#   - ACL permissions for /home/user/www or /var/www
-#   - No Docker
+#   - Dynamic PHP-FPM detection
+#   - Installs PHP if no usable PHP is available
+#   - Multiple PHP versions supported
+#   - PHP version selection
+#   - Laravel version recommendation based on selected PHP
+#   - Normal Laravel mode: Composer create-project
+#   - Vemto mode: prepares an empty project directory for Vemto
+#   - Dynamic project/base directory selection
+#   - MySQL database creation
+#   - Optional dedicated MySQL user
+#   - Apache VirtualHost
+#   - Per-project PHP-FPM socket
+#   - ACL handling for projects under /home/...
+#   - Correct Laravel storage/bootstrap permissions
+#   - .env generation
+#   - Laravel application key generation
+#   - Apache config validation before reload
+#   - Final verification
+#
+# Supported:
+#   Debian
+#   Ubuntu
 #
 # Usage:
-#   sudo /home/oirdimed/applications/add-laravel-project.sh
+#   sudo ./add-laravel-project.sh
 #
-# ============================================================
+# ------------------------------------------------------------------------------
 
 set -Eeuo pipefail
 
-# ============================================================
+# ============================================================================
 # CONFIGURATION
-# ============================================================
+# ============================================================================
 
 DEFAULT_BASE_DIR="/var/www"
 
 APACHE_SITES_AVAILABLE="/etc/apache2/sites-available"
 HOSTS_FILE="/etc/hosts"
 
-PHP_INSTALL_VERSION="8.3"
+WEB_USER="www-data"
+WEB_GROUP="www-data"
 
-MYSQL_OPTS_FILE=""
+MYSQL_CLIENT="mysql"
 
-# ============================================================
+# ============================================================================
 # COLORS / OUTPUT
-# ============================================================
+# ============================================================================
+
+GREEN="\033[0;32m"
+YELLOW="\033[1;33m"
+RED="\033[0;31m"
+BLUE="\033[0;34m"
+CYAN="\033[0;36m"
+RESET="\033[0m"
 
 info() {
-    echo -e "[\e[32mINFO\e[0m] $*"
+    echo -e "[${GREEN}INFO${RESET}] $*"
 }
 
 warn() {
-    echo -e "[\e[33mWARN\e[0m] $*"
+    echo -e "[${YELLOW}WARN${RESET}] $*"
 }
 
 error() {
-    echo -e "[\e[31mERROR\e[0m] $*" >&2
+    echo -e "[${RED}ERROR${RESET}] $*" >&2
 }
 
-title() {
+section() {
     echo
     echo "============================================================"
     echo " $*"
     echo "============================================================"
-    echo
 }
 
 die() {
@@ -68,758 +85,621 @@ die() {
     exit 1
 }
 
-# ============================================================
-# CLEANUP
-# ============================================================
+# ============================================================================
+# ERROR HANDLER
+# ============================================================================
 
-cleanup() {
-    if [[ -n "${MYSQL_OPTS_FILE:-}" && -f "$MYSQL_OPTS_FILE" ]]; then
-        rm -f "$MYSQL_OPTS_FILE"
-    fi
+trap 'error "Script failed at line $LINENO: $BASH_COMMAND"' ERR
+
+# ============================================================================
+# HELP
+# ============================================================================
+
+show_help() {
+    cat <<EOF
+
+Usage:
+  sudo $0
+
+Description:
+  Creates a Laravel-ready project with:
+
+    - PHP-FPM
+    - Laravel
+    - Apache VirtualHost
+    - MySQL database
+    - .test local domain
+    - Laravel permissions
+    - ACL support for /home/... projects
+    - Multi-PHP support
+
+Project types:
+
+  1) Normal Laravel
+     Creates Laravel using Composer.
+
+  2) Vemto
+     Creates an empty Laravel-ready directory for Vemto.
+     Vemto generates the application afterwards.
+
+EOF
 }
 
-trap cleanup EXIT INT TERM
-
-# ============================================================
-# ROOT / SUDO
-# ============================================================
+# ============================================================================
+# ROOT / SUDO USER
+# ============================================================================
 
 if [[ "$EUID" -ne 0 ]]; then
+    info "Root privileges are required. Re-running with sudo..."
     exec sudo -E "$0" "$@"
 fi
 
 if [[ -z "${SUDO_USER:-}" ]]; then
-    die "Run this script with sudo from your normal user account."
+    die "Run this script with sudo from a normal user account."
 fi
 
 OWNER="$SUDO_USER"
 OWNER_HOME="$(getent passwd "$OWNER" | cut -d: -f6)"
 
-if [[ -z "$OWNER_HOME" || ! -d "$OWNER_HOME" ]]; then
-    die "Could not determine home directory for user: $OWNER"
-fi
+[[ -n "$OWNER_HOME" ]] || die "Unable to determine home directory for $OWNER."
 
-# ============================================================
+info "Running as root."
+info "Project owner: $OWNER"
+info "Owner home: $OWNER_HOME"
+
+# ============================================================================
 # OS DETECTION
-# ============================================================
+# ============================================================================
 
-if [[ ! -f /etc/os-release ]]; then
-    die "/etc/os-release not found."
-fi
+section "OPERATING SYSTEM"
+
+[[ -f /etc/os-release ]] || die "/etc/os-release not found."
 
 source /etc/os-release
 
 case "${ID:-}" in
     debian|ubuntu)
+        info "Detected: ${PRETTY_NAME}"
         ;;
     *)
-        die "Unsupported OS: ${ID:-unknown}. This script supports Debian and Ubuntu."
+        die "This script supports Debian and Ubuntu only."
         ;;
 esac
 
-info "Detected OS: ${PRETTY_NAME:-$ID}"
-
-# ============================================================
-# BASIC REQUIREMENTS
-# ============================================================
-
-command -v apt-get >/dev/null 2>&1 || die "apt-get is required."
-command -v systemctl >/dev/null 2>&1 || die "systemctl is required."
+# ============================================================================
+# PACKAGE MANAGER
+# ============================================================================
 
 export DEBIAN_FRONTEND=noninteractive
 
-# ============================================================
-# INSTALL BASIC PACKAGES
-# ============================================================
+APT_UPDATED=false
 
-title "SYSTEM REQUIREMENTS"
-
-info "Updating package information..."
-
-apt-get update
-
-apt-get install -y \
-    ca-certificates \
-    curl \
-    wget \
-    gnupg \
-    lsb-release \
-    software-properties-common \
-    apt-transport-https \
-    unzip \
-    git \
-    acl \
-    apache2 \
-    mysql-client
-
-# ============================================================
-# PHP REPOSITORY
-# ============================================================
-
-setup_php_repository() {
-
-    if [[ "${ID}" == "ubuntu" ]]; then
-
-        info "Ubuntu detected."
-
-        if ! apt-cache show "php${PHP_INSTALL_VERSION}" >/dev/null 2>&1; then
-
-            warn "PHP ${PHP_INSTALL_VERSION} is not available in the current Ubuntu repositories."
-
-            info "Adding Ondrej PHP repository..."
-
-            apt-get install -y \
-                software-properties-common
-
-            if ! grep -Rqs "ppa.launchpad.net/ondrej/php" /etc/apt/sources.list.d/ 2>/dev/null; then
-                add-apt-repository -y ppa:ondrej/php
-            fi
-
-            apt-get update
-        fi
-
-    elif [[ "${ID}" == "debian" ]]; then
-
-        info "Debian detected."
-
-        if ! apt-cache show "php${PHP_INSTALL_VERSION}" >/dev/null 2>&1; then
-
-            warn "PHP ${PHP_INSTALL_VERSION} is not available in the current Debian repositories."
-
-            info "Adding packages.sury.org PHP repository..."
-
-            apt-get install -y \
-                ca-certificates \
-                curl \
-                gnupg
-
-            install -d -m 0755 /etc/apt/keyrings
-
-            if [[ ! -f /etc/apt/keyrings/debsuryorg-archive-keyring.gpg ]]; then
-
-                curl -fsSL \
-                    https://packages.sury.org/debsuryorg-archive-keyring.deb \
-                    -o /tmp/debsuryorg-archive-keyring.deb
-
-                dpkg -i /tmp/debsuryorg-archive-keyring.deb
-
-                rm -f /tmp/debsuryorg-archive-keyring.deb
-            fi
-
-            CODENAME="${VERSION_CODENAME:-}"
-
-            if [[ -z "$CODENAME" ]]; then
-                CODENAME="$(lsb_release -sc)"
-            fi
-
-            cat > /etc/apt/sources.list.d/php.list <<EOF
-deb [signed-by=/usr/share/keyrings/debsuryorg-archive-keyring.gpg] https://packages.sury.org/php/ ${CODENAME} main
-EOF
-
-            apt-get update
-        fi
+apt_update_once() {
+    if [[ "$APT_UPDATED" == false ]]; then
+        info "Updating APT package information..."
+        apt-get update
+        APT_UPDATED=true
     fi
 }
 
-# ============================================================
-# PHP INSTALLATION
-# ============================================================
+install_packages() {
+    apt_update_once
+    apt-get install -y "$@"
+}
 
-PHP_PACKAGES_COMMON=(
-    "php${PHP_INSTALL_VERSION}"
-    "php${PHP_INSTALL_VERSION}-cli"
-    "php${PHP_INSTALL_VERSION}-fpm"
-    "php${PHP_INSTALL_VERSION}-mysql"
-    "php${PHP_INSTALL_VERSION}-mbstring"
-    "php${PHP_INSTALL_VERSION}-xml"
-    "php${PHP_INSTALL_VERSION}-curl"
-    "php${PHP_INSTALL_VERSION}-zip"
-    "php${PHP_INSTALL_VERSION}-bcmath"
-    "php${PHP_INSTALL_VERSION}-intl"
-    "php${PHP_INSTALL_VERSION}-gd"
-)
+# ============================================================================
+# BASIC DEPENDENCIES
+# ============================================================================
 
-install_php_version() {
+section "CHECKING BASIC DEPENDENCIES"
 
-    local VERSION="$1"
+for cmd in apache2ctl systemctl curl sed grep awk find; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        warn "$cmd not found."
+    fi
+done
 
-    title "INSTALL PHP ${VERSION}"
+if ! command -v apache2 >/dev/null 2>&1; then
+    info "Installing Apache..."
+    install_packages apache2
+fi
 
-    setup_php_repository
+if ! command -v mysql >/dev/null 2>&1; then
+    info "Installing MySQL client..."
+    install_packages mysql-client
+fi
 
-    local PACKAGES=(
-        "php${VERSION}"
-        "php${VERSION}-cli"
-        "php${VERSION}-fpm"
-        "php${VERSION}-mysql"
-        "php${VERSION}-mbstring"
-        "php${VERSION}-xml"
-        "php${VERSION}-curl"
-        "php${VERSION}-zip"
-        "php${VERSION}-bcmath"
-        "php${VERSION}-intl"
-        "php${VERSION}-gd"
+if ! command -v setfacl >/dev/null 2>&1; then
+    info "Installing ACL support..."
+    install_packages acl
+fi
+
+# ============================================================================
+# APACHE VERSION
+# ============================================================================
+
+section "APACHE"
+
+APACHE_VERSION="$(apache2 -v 2>/dev/null | head -1 || true)"
+
+if [[ "$APACHE_VERSION" != *"Apache/2.4"* ]]; then
+    die "Apache 2.4 or newer is required. Detected: $APACHE_VERSION"
+fi
+
+info "$APACHE_VERSION"
+
+systemctl enable --now apache2
+
+# ============================================================================
+# PHP VERSION DETECTION
+# ============================================================================
+
+detect_php_fpm_versions() {
+    mapfile -t INSTALLED_PHP_VERSIONS < <(
+        find /usr/sbin -maxdepth 1 -type f -name 'php-fpm*' -printf '%f\n' 2>/dev/null |
+        sed -nE 's/^php-fpm([0-9]+\.[0-9]+)$/\1/p' |
+        sort -uV
     )
-
-    info "Installing PHP ${VERSION}..."
-
-    apt-get install -y "${PACKAGES[@]}"
-
-    systemctl enable --now "php${VERSION}-fpm"
-
-    info "PHP ${VERSION} installed successfully."
 }
 
-# ============================================================
-# DETECT PHP CLI
-# ============================================================
+detect_php_fpm_versions
 
-detect_php_cli() {
+# ============================================================================
+# PHP INSTALLATION IF NONE EXISTS
+# ============================================================================
 
-    PHP_CLI_VERSIONS=()
+if [[ ${#INSTALLED_PHP_VERSIONS[@]} -eq 0 ]]; then
 
-    for BIN in /usr/bin/php[0-9]*.[0-9]*; do
+    section "PHP NOT INSTALLED"
 
-        [[ -x "$BIN" ]] || continue
+    warn "No PHP-FPM installation was detected."
 
-        VERSION="$("$BIN" -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null || true)"
-
-        [[ -n "$VERSION" ]] || continue
-
-        if [[ ! " ${PHP_CLI_VERSIONS[*]} " =~ " ${VERSION} " ]]; then
-            PHP_CLI_VERSIONS+=("$VERSION")
-        fi
-    done
-
-    if command -v php >/dev/null 2>&1; then
-
-        VERSION="$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null || true)"
-
-        if [[ -n "$VERSION" ]]; then
-
-            if [[ ! " ${PHP_CLI_VERSIONS[*]} " =~ " ${VERSION} " ]]; then
-                PHP_CLI_VERSIONS+=("$VERSION")
-            fi
-
-        fi
-    fi
-
-    printf '%s\n' "${PHP_CLI_VERSIONS[@]}" | sort -uV
-}
-
-# ============================================================
-# DETECT PHP FPM
-# ============================================================
-
-detect_php_fpm() {
-
-    PHP_FPM_VERSIONS=()
-
-    for BIN in /usr/sbin/php-fpm[0-9]*.[0-9]*; do
-
-        [[ -x "$BIN" ]] || continue
-
-        VERSION="$(basename "$BIN" | sed -E 's/php-fpm([0-9]+\.[0-9]+)/\1/')"
-
-        [[ "$VERSION" =~ ^[0-9]+\.[0-9]+$ ]] || continue
-
-        if [[ ! " ${PHP_FPM_VERSIONS[*]} " =~ " ${VERSION} " ]]; then
-            PHP_FPM_VERSIONS+=("$VERSION")
-        fi
-    done
-
-    printf '%s\n' "${PHP_FPM_VERSIONS[@]}" | sort -uV
-}
-
-# ============================================================
-# INITIAL PHP DETECTION
-# ============================================================
-
-mapfile -t PHP_CLI_VERSIONS < <(detect_php_cli)
-mapfile -t PHP_FPM_VERSIONS < <(detect_php_fpm)
-
-if [[ ${#PHP_CLI_VERSIONS[@]} -eq 0 && ${#PHP_FPM_VERSIONS[@]} -eq 0 ]]; then
-
-    title "PHP NOT INSTALLED"
-
-    echo "No PHP CLI or PHP-FPM installation was detected."
     echo
-    echo "The script needs PHP to continue."
+    echo "Laravel requires PHP."
     echo
-    read -rp "Install PHP ${PHP_INSTALL_VERSION}? [Y/n]: " INSTALL_PHP
+    echo "The script can install the default PHP version available"
+    echo "from the current Debian/Ubuntu repositories."
+    echo
 
+    read -rp "Install PHP-FPM now? [Y/n]: " INSTALL_PHP
     INSTALL_PHP="${INSTALL_PHP:-Y}"
 
     if [[ ! "$INSTALL_PHP" =~ ^[Yy]$ ]]; then
-        die "PHP is required."
+        die "PHP-FPM is required."
     fi
 
-    install_php_version "$PHP_INSTALL_VERSION"
+    apt_update_once
 
+    info "Installing PHP, PHP-FPM and Laravel-required extensions..."
+
+    apt-get install -y \
+        php \
+        php-fpm \
+        php-cli \
+        php-common \
+        php-mysql \
+        php-mbstring \
+        php-xml \
+        php-curl \
+        php-zip \
+        php-bcmath \
+        php-intl \
+        php-gd
+
+    detect_php_fpm_versions
+
+    [[ ${#INSTALLED_PHP_VERSIONS[@]} -gt 0 ]] ||
+        die "PHP-FPM installation completed but no PHP-FPM version was detected."
 fi
 
-# ============================================================
-# RE-DETECT PHP
-# ============================================================
+# ============================================================================
+# DISPLAY PHP VERSIONS
+# ============================================================================
 
-mapfile -t PHP_CLI_VERSIONS < <(detect_php_cli)
-mapfile -t PHP_FPM_VERSIONS < <(detect_php_fpm)
+section "INSTALLED PHP-FPM VERSIONS"
 
-# ============================================================
-# DISPLAY PHP CLI
-# ============================================================
-
-title "PHP ENVIRONMENT"
-
-if [[ ${#PHP_CLI_VERSIONS[@]} -gt 0 ]]; then
-
-    echo "Installed PHP CLI versions:"
-
-    for VERSION in "${PHP_CLI_VERSIONS[@]}"; do
-        echo "  PHP ${VERSION}"
-    done
-
-else
-
-    warn "No PHP CLI detected."
-
-fi
-
-echo
-
-if [[ ${#PHP_FPM_VERSIONS[@]} -gt 0 ]]; then
-
-    echo "Installed PHP-FPM versions:"
-
-    for VERSION in "${PHP_FPM_VERSIONS[@]}"; do
-        echo "  PHP ${VERSION}"
-    done
-
-else
-
-    warn "No PHP-FPM detected."
-
-fi
-
-# ============================================================
-# SELECT HIGHEST PHP FPM
-# ============================================================
-
-if [[ ${#PHP_FPM_VERSIONS[@]} -eq 0 ]]; then
-
-    if [[ ${#PHP_CLI_VERSIONS[@]} -eq 0 ]]; then
-        die "No usable PHP installation detected."
-    fi
-
-    HIGHEST_PHP="${PHP_CLI_VERSIONS[-1]}"
-
-    warn "PHP-FPM is missing."
-
-    read -rp "Install PHP ${HIGHEST_PHP}-FPM and required extensions? [Y/n]: " INSTALL_FPM
-
-    INSTALL_FPM="${INSTALL_FPM:-Y}"
-
-    if [[ "$INSTALL_FPM" =~ ^[Yy]$ ]]; then
-        install_php_version "$HIGHEST_PHP"
-    else
-        die "PHP-FPM is required for Apache."
-    fi
-
-    mapfile -t PHP_FPM_VERSIONS < <(detect_php_fpm)
-
-else
-
-    HIGHEST_PHP="${PHP_FPM_VERSIONS[-1]}"
-
-fi
-
-info "Highest installed PHP-FPM version: PHP ${HIGHEST_PHP}"
-
-# ============================================================
-# PHP VERSION SELECTION
-# ============================================================
-
-title "SELECT PHP VERSION"
-
-for i in "${!PHP_FPM_VERSIONS[@]}"; do
-    echo "  $((i + 1))) PHP ${PHP_FPM_VERSIONS[$i]}"
+for i in "${!INSTALLED_PHP_VERSIONS[@]}"; do
+    echo "  $((i + 1))) PHP ${INSTALLED_PHP_VERSIONS[$i]}"
 done
 
-DEFAULT_INDEX=$((${#PHP_FPM_VERSIONS[@]}))
+HIGHEST_PHP="${INSTALLED_PHP_VERSIONS[-1]}"
 
 echo
+info "Highest installed PHP-FPM version: PHP $HIGHEST_PHP"
 
-read -rp \
-"Select PHP version [default: ${DEFAULT_INDEX} - PHP ${PHP_FPM_VERSIONS[-1]}]: " \
-PHP_SELECTION
+# ============================================================================
+# PHP VERSION SELECTION
+# ============================================================================
 
-PHP_SELECTION="${PHP_SELECTION:-$DEFAULT_INDEX}"
+while true; do
 
-if [[ "$PHP_SELECTION" =~ ^[0-9]+$ ]] &&
-   (( PHP_SELECTION >= 1 && PHP_SELECTION <= ${#PHP_FPM_VERSIONS[@]} )); then
+    echo
+    read -rp "Select PHP version [default: ${#INSTALLED_PHP_VERSIONS[@]} - PHP $HIGHEST_PHP]: " PHP_SELECTION
 
-    PHP_VER="${PHP_FPM_VERSIONS[$((PHP_SELECTION - 1))]}"
+    PHP_SELECTION="${PHP_SELECTION:-${#INSTALLED_PHP_VERSIONS[@]}}"
 
-else
+    if [[ "$PHP_SELECTION" =~ ^[0-9]+$ ]] &&
+       (( PHP_SELECTION >= 1 && PHP_SELECTION <= ${#INSTALLED_PHP_VERSIONS[@]} )); then
 
-    if [[ " ${PHP_FPM_VERSIONS[*]} " =~ " ${PHP_SELECTION} " ]]; then
+        PHP_VER="${INSTALLED_PHP_VERSIONS[$((PHP_SELECTION - 1))]}"
+        break
+    fi
+
+    if printf '%s\n' "${INSTALLED_PHP_VERSIONS[@]}" | grep -qx "$PHP_SELECTION"; then
         PHP_VER="$PHP_SELECTION"
-    else
-        die "Invalid PHP selection."
+        break
     fi
 
-fi
+    warn "Invalid PHP selection."
+done
 
-info "Selected PHP: ${PHP_VER}"
-
-# ============================================================
-# ENSURE CLI EXISTS FOR SELECTED PHP
-# ============================================================
-
-if [[ ! -x "/usr/bin/php${PHP_VER}" ]]; then
-
-    warn "PHP ${PHP_VER} CLI is missing."
-
-    read -rp "Install PHP ${PHP_VER} CLI and required extensions? [Y/n]: " INSTALL_CLI
-
-    INSTALL_CLI="${INSTALL_CLI:-Y}"
-
-    if [[ "$INSTALL_CLI" =~ ^[Yy]$ ]]; then
-        install_php_version "$PHP_VER"
-    else
-        die "PHP ${PHP_VER} CLI is required for Composer."
-    fi
-
-fi
+info "Selected PHP: $PHP_VER"
 
 PHP_BIN="/usr/bin/php${PHP_VER}"
+PHP_FPM_SERVICE="php${PHP_VER}-fpm"
+PHP_FPM_SOCKET="/run/php/php${PHP_VER}-fpm.sock"
 
-if [[ ! -x "$PHP_BIN" ]]; then
-    die "PHP binary not found: $PHP_BIN"
-fi
+[[ -x "$PHP_BIN" ]] || die "$PHP_BIN not found."
 
-# ============================================================
-# LARAVEL COMPATIBILITY
-# ============================================================
+# ============================================================================
+# PHP EXTENSIONS
+# ============================================================================
 
-laravel_versions_for_php() {
+section "PHP EXTENSIONS"
 
-    local PHP="$1"
+PHP_EXTENSIONS=(
+    mysql
+    mbstring
+    xml
+    curl
+    zip
+    bcmath
+    intl
+    gd
+)
 
-    case "$PHP" in
+MISSING_EXTENSIONS=()
 
-        8.5)
-            echo "13 12"
-            ;;
-
-        8.4)
-            echo "13 12 11"
-            ;;
-
-        8.3)
-            echo "13 12 11 10"
-            ;;
-
-        8.2)
-            echo "12 11 10"
-            ;;
-
-        8.1)
-            echo "10"
-            ;;
-
-        8.0)
-            echo "9"
-            ;;
-
-        7.4)
-            echo "8"
-            ;;
-
-        7.3)
-            echo "8"
-            ;;
-
-        *)
-            echo ""
-            ;;
-
-    esac
-}
-
-recommended_laravel_for_php() {
-
-    local PHP="$1"
-
-    case "$PHP" in
-
-        8.5|8.4|8.3)
-            echo "13"
-            ;;
-
-        8.2)
-            echo "12"
-            ;;
-
-        8.1)
-            echo "10"
-            ;;
-
-        8.0)
-            echo "9"
-            ;;
-
-        7.4|7.3)
-            echo "8"
-            ;;
-
-        *)
-            echo ""
-            ;;
-
-    esac
-}
-
-COMPATIBLE_LARAVEL="$(laravel_versions_for_php "$PHP_VER")"
-RECOMMENDED_LARAVEL="$(recommended_laravel_for_php "$PHP_VER")"
-
-if [[ -z "$COMPATIBLE_LARAVEL" ]]; then
-    die "No supported Laravel version is compatible with PHP ${PHP_VER}."
-fi
-
-# ============================================================
-# LARAVEL VERSION SELECTION
-# ============================================================
-
-title "LARAVEL VERSION"
-
-echo "PHP selected: PHP ${PHP_VER}"
-echo
-
-echo "Compatible Laravel versions:"
-
-LARAVEL_ARRAY=($COMPATIBLE_LARAVEL)
-
-for i in "${!LARAVEL_ARRAY[@]}"; do
-
-    VERSION="${LARAVEL_ARRAY[$i]}"
-
-    if [[ "$VERSION" == "$RECOMMENDED_LARAVEL" ]]; then
-        echo "  $((i + 1))) Laravel ${VERSION}  <-- RECOMMENDED"
-    else
-        echo "  $((i + 1))) Laravel ${VERSION}"
+for ext in "${PHP_EXTENSIONS[@]}"; do
+    if ! "$PHP_BIN" -m 2>/dev/null | grep -qi "^${ext}$"; then
+        MISSING_EXTENSIONS+=("$ext")
     fi
-
 done
 
-echo
+if [[ ${#MISSING_EXTENSIONS[@]} -gt 0 ]]; then
 
-DEFAULT_LARAVEL_INDEX=1
+    warn "Missing PHP extensions for PHP $PHP_VER:"
+    printf '  %s\n' "${MISSING_EXTENSIONS[@]}"
 
-read -rp \
-"Select Laravel version [default: ${DEFAULT_LARAVEL_INDEX} - Laravel ${RECOMMENDED_LARAVEL}]: " \
-LARAVEL_SELECTION
+    read -rp "Install missing PHP extensions now? [Y/n]: " INSTALL_EXT
+    INSTALL_EXT="${INSTALL_EXT:-Y}"
 
-LARAVEL_SELECTION="${LARAVEL_SELECTION:-$DEFAULT_LARAVEL_INDEX}"
+    if [[ "$INSTALL_EXT" =~ ^[Yy]$ ]]; then
 
-if [[ "$LARAVEL_SELECTION" =~ ^[0-9]+$ ]] &&
-   (( LARAVEL_SELECTION >= 1 && LARAVEL_SELECTION <= ${#LARAVEL_ARRAY[@]} )); then
+        apt_update_once
 
-    LARAVEL_VER="${LARAVEL_ARRAY[$((LARAVEL_SELECTION - 1))]}"
+        PACKAGES=()
 
-else
+        for ext in "${MISSING_EXTENSIONS[@]}"; do
+            PACKAGES+=("php${PHP_VER}-${ext}")
+        done
 
-    if [[ " ${LARAVEL_ARRAY[*]} " =~ " ${LARAVEL_SELECTION} " ]]; then
-        LARAVEL_VER="$LARAVEL_SELECTION"
+        apt-get install -y "${PACKAGES[@]}"
+
     else
-        die "Invalid Laravel selection."
+        die "Required PHP extensions are missing."
     fi
-
 fi
 
-info "Selected Laravel: ${LARAVEL_VER}"
+info "Required PHP extensions verified."
 
-# ============================================================
-# PROJECT TYPE
-# ============================================================
+# ============================================================================
+# PHP-FPM SERVICE
+# ============================================================================
 
-title "PROJECT TYPE"
+section "PHP-FPM SERVICE"
 
-echo "  1) Normal Laravel"
-echo "     Create Laravel project with Composer"
+if ! systemctl is-active --quiet "$PHP_FPM_SERVICE"; then
+    info "Starting $PHP_FPM_SERVICE..."
+    systemctl enable --now "$PHP_FPM_SERVICE"
+fi
+
+if ! systemctl is-active --quiet "$PHP_FPM_SERVICE"; then
+    systemctl status "$PHP_FPM_SERVICE" --no-pager || true
+    die "$PHP_FPM_SERVICE is not running."
+fi
+
+info "$PHP_FPM_SERVICE: active"
+
+if [[ ! -S "$PHP_FPM_SOCKET" ]]; then
+    warn "PHP-FPM socket not found immediately."
+
+    sleep 2
+
+    if [[ ! -S "$PHP_FPM_SOCKET" ]]; then
+        systemctl status "$PHP_FPM_SERVICE" --no-pager || true
+        die "PHP-FPM socket not found: $PHP_FPM_SOCKET"
+    fi
+fi
+
+info "PHP-FPM socket: $PHP_FPM_SOCKET"
+
+# ============================================================================
+# LARAVEL VERSION RECOMMENDATION
+# ============================================================================
+
+section "LARAVEL VERSION"
+
 echo
-echo "  2) Vemto project"
-echo "     Create empty project directory for Vemto generation"
+echo "PHP selected: PHP $PHP_VER"
 echo
 
-read -rp "Select project type [1]: " PROJECT_TYPE
+LARAVEL_OPTIONS=()
+RECOMMENDED_INDEX=1
 
-PROJECT_TYPE="${PROJECT_TYPE:-1}"
+case "$PHP_VER" in
 
-case "$PROJECT_TYPE" in
-    1)
-        PROJECT_MODE="normal"
+    8.5)
+        LARAVEL_OPTIONS=("13" "12")
+        RECOMMENDED_INDEX=1
         ;;
-    2)
-        PROJECT_MODE="vemto"
+
+    8.4)
+        LARAVEL_OPTIONS=("13" "12" "11")
+        RECOMMENDED_INDEX=1
         ;;
+
+    8.3)
+        LARAVEL_OPTIONS=("13" "12" "11" "10")
+        RECOMMENDED_INDEX=1
+        ;;
+
+    8.2)
+        LARAVEL_OPTIONS=("12" "11")
+        RECOMMENDED_INDEX=1
+        ;;
+
+    8.1)
+        LARAVEL_OPTIONS=("10")
+        RECOMMENDED_INDEX=1
+        ;;
+
+    8.0)
+        LARAVEL_OPTIONS=("9")
+        RECOMMENDED_INDEX=1
+        ;;
+
+    7.4)
+        LARAVEL_OPTIONS=("8")
+        RECOMMENDED_INDEX=1
+        ;;
+
+    7.3)
+        LARAVEL_OPTIONS=("8")
+        RECOMMENDED_INDEX=1
+        ;;
+
     *)
-        die "Invalid project type."
+        die "No supported Laravel version recommendation for PHP $PHP_VER."
         ;;
 esac
 
-# ============================================================
+echo "Recommended Laravel version:"
+echo "  ${LARAVEL_OPTIONS[$((RECOMMENDED_INDEX - 1))]}"
+
+echo
+echo "Available compatible Laravel versions:"
+
+for i in "${!LARAVEL_OPTIONS[@]}"; do
+
+    VERSION="${LARAVEL_OPTIONS[$i]}"
+
+    if (( i + 1 == RECOMMENDED_INDEX )); then
+        echo "  $((i + 1))) Laravel $VERSION  [RECOMMENDED]"
+    else
+        echo "  $((i + 1))) Laravel $VERSION"
+    fi
+done
+
+while true; do
+
+    read -rp \
+        "Select Laravel version [default: $RECOMMENDED_INDEX]: " \
+        LARAVEL_SELECTION
+
+    LARAVEL_SELECTION="${LARAVEL_SELECTION:-$RECOMMENDED_INDEX}"
+
+    if [[ "$LARAVEL_SELECTION" =~ ^[0-9]+$ ]] &&
+       (( LARAVEL_SELECTION >= 1 && LARAVEL_SELECTION <= ${#LARAVEL_OPTIONS[@]} )); then
+
+        LARAVEL_MAJOR="${LARAVEL_OPTIONS[$((LARAVEL_SELECTION - 1))]}"
+        break
+    fi
+
+    warn "Invalid Laravel selection."
+done
+
+LARAVEL_CONSTRAINT="^${LARAVEL_MAJOR}.0"
+
+info "Selected Laravel: $LARAVEL_CONSTRAINT"
+
+# ============================================================================
+# PROJECT TYPE
+# ============================================================================
+
+section "PROJECT TYPE"
+
+echo
+echo "  1) Normal Laravel"
+echo "     Composer creates the Laravel application."
+echo
+echo "  2) Vemto"
+echo "     Creates an empty project directory."
+echo "     Vemto will generate the Laravel application."
+echo
+
+while true; do
+
+    read -rp "Select project type [1]: " PROJECT_TYPE
+    PROJECT_TYPE="${PROJECT_TYPE:-1}"
+
+    case "$PROJECT_TYPE" in
+        1|2)
+            break
+            ;;
+        *)
+            warn "Please choose 1 or 2."
+            ;;
+    esac
+done
+
+if [[ "$PROJECT_TYPE" == "1" ]]; then
+    info "Project type: Normal Laravel"
+else
+    info "Project type: Vemto"
+fi
+
+# ============================================================================
 # PROJECT NAME
-# ============================================================
+# ============================================================================
 
-title "PROJECT"
+section "PROJECT NAME"
 
-read -rp "Enter project name (e.g. test2): " PROJ_NAME
+while true; do
 
-PROJ="$(echo "$PROJ_NAME" | tr -cd '[:alnum:]_-')"
+    read -rp "Enter project name (example: myapp): " PROJ
 
-if [[ -z "$PROJ" ]]; then
-    die "Invalid project name."
-fi
+    if [[ "$PROJ" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]]; then
+        break
+    fi
 
-if [[ ! "$PROJ" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]]; then
-    die "Project name contains invalid characters."
-fi
+    warn "Invalid project name."
+    warn "Use letters, numbers, underscores and hyphens."
+    warn "The first character must be alphanumeric."
+done
 
 SERVER_NAME="${PROJ}.test"
 
-# ============================================================
+# ============================================================================
 # BASE DIRECTORY
-# ============================================================
+# ============================================================================
+
+section "PROJECT DIRECTORY"
 
 echo
+echo "Choose where the SaaS project should be stored."
+echo
+echo "Examples:"
+echo "  /var/www"
+echo "  /home/user/www"
+echo "  /srv/www"
+echo
+
 read -rp \
-"Enter base directory for projects [${DEFAULT_BASE_DIR}]: " \
-INPUT_BASE_DIR
+    "Enter base directory for projects [default: $DEFAULT_BASE_DIR]: " \
+    BASE_DIR
 
-BASE_DIR="${INPUT_BASE_DIR:-$DEFAULT_BASE_DIR}"
+BASE_DIR="${BASE_DIR:-$DEFAULT_BASE_DIR}"
 
-# Expand ~
-
-if [[ "$BASE_DIR" == "~"* ]]; then
-    BASE_DIR="${BASE_DIR/#\~/$OWNER_HOME}"
+# Expand ~ safely
+if [[ "$BASE_DIR" == "~" ]]; then
+    BASE_DIR="$OWNER_HOME"
+elif [[ "$BASE_DIR" == "~/"* ]]; then
+    BASE_DIR="${OWNER_HOME}/${BASE_DIR#~/}"
 fi
 
-BASE_DIR="$(readlink -m "$BASE_DIR")"
+# Remove trailing slash
+BASE_DIR="${BASE_DIR%/}"
 
 PROJECT_DIR="${BASE_DIR}/${PROJ}"
 
-info "Base directory: ${BASE_DIR}"
-info "Project directory: ${PROJECT_DIR}"
+info "Base directory: $BASE_DIR"
+info "Project directory: $PROJECT_DIR"
 
-# ============================================================
-# SAFETY CHECK
-# ============================================================
+# ============================================================================
+# PROJECT DIRECTORY SAFETY
+# ============================================================================
 
 if [[ -e "$PROJECT_DIR" ]]; then
 
-    if [[ "$PROJECT_MODE" == "normal" ]]; then
+    if [[ "$PROJECT_TYPE" == "2" ]]; then
+
+        warn "Project directory already exists:"
+        echo "  $PROJECT_DIR"
+
+        if [[ -n "$(find "$PROJECT_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
+            warn "Directory is not empty."
+        fi
+
+        read -rp "Continue and configure this existing directory? [y/N]: " CONTINUE_EXISTING
+
+        if [[ ! "$CONTINUE_EXISTING" =~ ^[Yy]$ ]]; then
+            die "Operation cancelled."
+        fi
+
+    else
         die "Project directory already exists: $PROJECT_DIR"
     fi
+fi
 
-    warn "Project directory already exists: $PROJECT_DIR"
+# ============================================================================
+# CREATE BASE DIRECTORY
+# ============================================================================
 
-    read -rp "Continue with Vemto project? [y/N]: " CONTINUE_EXISTING
+if [[ ! -d "$BASE_DIR" ]]; then
+    info "Creating base directory: $BASE_DIR"
+    mkdir -p "$BASE_DIR"
+fi
 
-    if [[ ! "$CONTINUE_EXISTING" =~ ^[Yy]$ ]]; then
-        exit 0
+# ============================================================================
+# MYSQL
+# ============================================================================
+
+section "MYSQL"
+
+if ! systemctl is-active --quiet mysql 2>/dev/null &&
+   ! systemctl is-active --quiet mariadb 2>/dev/null; then
+
+    warn "MySQL/MariaDB service is not running."
+
+    if systemctl list-unit-files | grep -q '^mysql.service'; then
+        systemctl enable --now mysql
+    elif systemctl list-unit-files | grep -q '^mariadb.service'; then
+        systemctl enable --now mariadb
+    else
+        die "MySQL/MariaDB is not installed."
     fi
-
 fi
 
-# ============================================================
-# CREATE BASE / PROJECT DIRECTORY
-# ============================================================
-
-mkdir -p "$PROJECT_DIR"
-
-# ============================================================
-# VEMTO MODE
-# ============================================================
-
-if [[ "$PROJECT_MODE" == "vemto" ]]; then
-
-    title "VEMTO PROJECT"
-
-    info "Preparing empty directory for Vemto..."
-
-    mkdir -p "$PROJECT_DIR"
-
-    # Do NOT create fake Laravel folders here.
-    # Vemto will generate the Laravel structure.
-
-    info "Project directory ready:"
-    echo "  ${PROJECT_DIR}"
-
+if systemctl is-active --quiet mysql 2>/dev/null; then
+    DB_SERVICE="mysql"
+elif systemctl is-active --quiet mariadb 2>/dev/null; then
+    DB_SERVICE="mariadb"
+else
+    die "Unable to determine MySQL/MariaDB service."
 fi
 
-# ============================================================
-# NORMAL LARAVEL MODE
-# ============================================================
+info "Database service: $DB_SERVICE"
 
-if [[ "$PROJECT_MODE" == "normal" ]]; then
+# ============================================================================
+# MYSQL ROOT CONNECTION
+# ============================================================================
 
-    title "LARAVEL INSTALLATION"
+echo
+read -rsp "Enter MySQL root password (leave blank for socket authentication): " MYSQL_ROOT_PASSWORD
+echo
 
-    if [[ -n "$(find "$PROJECT_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
-        die "Directory is not empty: $PROJECT_DIR"
+MYSQL_OPTS_FILE=""
+
+cleanup_mysql() {
+    if [[ -n "${MYSQL_OPTS_FILE:-}" && -f "$MYSQL_OPTS_FILE" ]]; then
+        rm -f "$MYSQL_OPTS_FILE"
     fi
+}
 
-    command -v composer >/dev/null 2>&1 || die "Composer is not installed."
+trap cleanup_mysql EXIT
 
-    COMPOSER_BIN="$(command -v composer)"
-
-    info "Composer: ${COMPOSER_BIN}"
-    info "PHP: ${PHP_BIN}"
-    info "Laravel: ${LARAVEL_VER}"
-
-    info "Creating Laravel ${LARAVEL_VER} project..."
-
-    su - "$OWNER" -c \
-        "$PHP_BIN -d memory_limit=-1 '$COMPOSER_BIN' create-project laravel/laravel '$PROJECT_DIR' '^${LARAVEL_VER}.0'"
-
-    info "Laravel ${LARAVEL_VER} installed."
-
-fi
-
-# ============================================================
-# PROJECT STRUCTURE DETECTION
-# ============================================================
-
-if [[ "$PROJECT_MODE" == "normal" ]]; then
-
-    if [[ ! -f "$PROJECT_DIR/artisan" ]]; then
-        die "Laravel installation failed: artisan not found."
-    fi
-
-fi
-
-# ============================================================
-# CREATE REQUIRED DIRECTORIES
-# ============================================================
-
-mkdir -p \
-    "$PROJECT_DIR/storage" \
-    "$PROJECT_DIR/bootstrap/cache"
-
-# ============================================================
-# DATABASE
-# ============================================================
-
-title "DATABASE"
-
-command -v mysql >/dev/null 2>&1 || die "MySQL client is not installed."
-
-read -rp \
-"Enter MySQL root password (leave blank for Unix socket authentication): " \
-MYSQL_ROOT_PWD
-
-if [[ -z "$MYSQL_ROOT_PWD" ]]; then
+if [[ -z "$MYSQL_ROOT_PASSWORD" ]]; then
 
     MYSQL_CMD=(mysql -u root)
 
@@ -832,144 +712,204 @@ else
     cat > "$MYSQL_OPTS_FILE" <<EOF
 [client]
 user=root
-password=${MYSQL_ROOT_PWD}
+password=${MYSQL_ROOT_PASSWORD}
 EOF
 
     MYSQL_CMD=(mysql "--defaults-extra-file=$MYSQL_OPTS_FILE")
-
 fi
 
 if ! "${MYSQL_CMD[@]}" -e "SELECT 1;" >/dev/null 2>&1; then
-    die "Could not connect to MySQL."
+    die "Unable to connect to MySQL as root."
 fi
 
-info "Connected to MySQL."
+info "MySQL connection successful."
+
+# ============================================================================
+# DATABASE NAME
+# ============================================================================
 
 DB_NAME="$PROJ"
-DB_USER="${PROJ}_user"
 
 echo
-read -rp \
-"Create database '${DB_NAME}'? [Y/n]: " CREATE_DB
+read -rp "Database name [default: $DB_NAME]: " INPUT_DB_NAME
+DB_NAME="${INPUT_DB_NAME:-$DB_NAME}"
 
-CREATE_DB="${CREATE_DB:-Y}"
-
-if [[ "$CREATE_DB" =~ ^[Yy]$ ]]; then
-
-    "${MYSQL_CMD[@]}" -e \
-        "CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-
-    info "Database '${DB_NAME}' ready."
-
+if [[ ! "$DB_NAME" =~ ^[a-zA-Z0-9_]+$ ]]; then
+    die "Invalid database name."
 fi
 
+# ============================================================================
+# CREATE DATABASE
+# ============================================================================
+
+info "Creating database: $DB_NAME"
+
+"${MYSQL_CMD[@]}" <<SQL
+CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\`
+CHARACTER SET utf8mb4
+COLLATE utf8mb4_unicode_ci;
+SQL
+
+info "Database ready."
+
+# ============================================================================
+# DATABASE USER
+# ============================================================================
+
 echo
 read -rp \
-"Create dedicated MySQL user '${DB_USER}'? [Y/n]: " CREATE_DB_USER
+    "Create a dedicated MySQL user for this project? [Y/n]: " \
+    CREATE_DB_USER
 
 CREATE_DB_USER="${CREATE_DB_USER:-Y}"
 
+DB_USERNAME="root"
+DB_PASSWORD=""
+
 if [[ "$CREATE_DB_USER" =~ ^[Yy]$ ]]; then
 
+    DB_USERNAME="${PROJ}_user"
+
+    echo
     read -rsp \
-    "Enter password for '${DB_USER}' (leave blank to generate): " \
-    DB_PASS
+        "Enter password for MySQL user '$DB_USERNAME' (leave blank to generate): " \
+        DB_PASSWORD
 
     echo
 
-    if [[ -z "$DB_PASS" ]]; then
+    if [[ -z "$DB_PASSWORD" ]]; then
 
-        DB_PASS="$(tr -dc 'A-Za-z0-9!@#%^+=' < /dev/urandom | head -c 24 || true)"
+        DB_PASSWORD="$(tr -dc 'A-Za-z0-9!@#%+=_' </dev/urandom | head -c 24 || true)"
 
-        if [[ -z "$DB_PASS" ]]; then
-            DB_PASS="$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 20)"
+        if [[ ${#DB_PASSWORD} -lt 20 ]]; then
+            die "Unable to generate secure database password."
         fi
 
-        info "Generated database password."
+        info "Generated a secure database password."
 
     fi
 
-    # Escape single quotes for SQL
-    DB_PASS_SQL="${DB_PASS//\'/\'\'}"
+    # Escape single quotes for SQL.
+    DB_PASSWORD_SQL="${DB_PASSWORD//\'/\'\'}"
 
-    "${MYSQL_CMD[@]}" -e "
-CREATE USER IF NOT EXISTS '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS_SQL}';
-ALTER USER '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS_SQL}';
-GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'localhost';
+    info "Creating MySQL user: $DB_USERNAME"
+
+    "${MYSQL_CMD[@]}" <<SQL
+CREATE USER IF NOT EXISTS '${DB_USERNAME}'@'localhost'
+IDENTIFIED BY '${DB_PASSWORD_SQL}';
+
+CREATE USER IF NOT EXISTS '${DB_USERNAME}'@'127.0.0.1'
+IDENTIFIED BY '${DB_PASSWORD_SQL}';
+
+ALTER USER '${DB_USERNAME}'@'localhost'
+IDENTIFIED BY '${DB_PASSWORD_SQL}';
+
+ALTER USER '${DB_USERNAME}'@'127.0.0.1'
+IDENTIFIED BY '${DB_PASSWORD_SQL}';
+
+GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USERNAME}'@'localhost';
+
+GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USERNAME}'@'127.0.0.1';
+
 FLUSH PRIVILEGES;
-"
+SQL
 
-    info "MySQL user '${DB_USER}' configured."
+    info "Dedicated MySQL user created."
 
 else
 
-    DB_USER="root"
-    DB_PASS="$MYSQL_ROOT_PWD"
+    warn "Using MySQL root credentials in .env."
+fi
+
+# ============================================================================
+# NORMAL LARAVEL MODE
+# ============================================================================
+
+if [[ "$PROJECT_TYPE" == "1" ]]; then
+
+    section "CREATING LARAVEL APPLICATION"
+
+    if [[ -e "$PROJECT_DIR" ]]; then
+        die "Target directory already exists. Normal Laravel mode requires an empty/nonexistent directory."
+    fi
+
+    info "Creating Laravel $LARAVEL_MAJOR using PHP $PHP_VER..."
+
+    mkdir -p "$PROJECT_DIR"
+
+    chown "$OWNER:$WEB_GROUP" "$PROJECT_DIR"
+
+    COMPOSER_BIN="$(command -v composer || true)"
+
+    if [[ -z "$COMPOSER_BIN" ]]; then
+        info "Composer is not installed."
+
+        apt_update_once
+        apt-get install -y composer
+
+        COMPOSER_BIN="$(command -v composer || true)"
+    fi
+
+    [[ -n "$COMPOSER_BIN" ]] || die "Composer could not be installed."
+
+    info "Composer: $COMPOSER_BIN"
+    info "Composer PHP: $PHP_BIN"
+
+    # Composer is explicitly executed through the selected PHP binary.
+    su - "$OWNER" -c \
+        "$PHP_BIN -d memory_limit=-1 '$COMPOSER_BIN' create-project laravel/laravel '$PROJECT_DIR' '$LARAVEL_CONSTRAINT' --prefer-dist"
+
+    info "Laravel application created."
+
+else
+
+    # =========================================================================
+    # VEMTO MODE
+    # =========================================================================
+
+    section "PREPARING VEMTO PROJECT"
+
+    mkdir -p "$PROJECT_DIR"
+
+    info "Created/using empty Vemto project directory:"
+    info "$PROJECT_DIR"
+
+    info "Vemto will generate the Laravel application here."
 
 fi
 
-# ============================================================
+# ============================================================================
+# CREATE REQUIRED LARAVEL DIRECTORIES
+# ============================================================================
+
+section "LARAVEL DIRECTORIES"
+
+mkdir -p "$PROJECT_DIR/storage"
+mkdir -p "$PROJECT_DIR/bootstrap/cache"
+
+if [[ ! -d "$PROJECT_DIR/public" ]]; then
+    mkdir -p "$PROJECT_DIR/public"
+fi
+
+info "storage: OK"
+info "bootstrap/cache: OK"
+info "public: OK"
+
+# ============================================================================
 # .ENV
-# ============================================================
+# ============================================================================
 
-ENV_FILE="${PROJECT_DIR}/.env"
+section "ENVIRONMENT CONFIGURATION"
 
-if [[ "$PROJECT_MODE" == "normal" ]]; then
+ENV_FILE="$PROJECT_DIR/.env"
 
-    if [[ ! -f "$ENV_FILE" ]]; then
+if [[ -f "$ENV_FILE" ]]; then
 
-        cat > "$ENV_FILE" <<EOF
-APP_NAME=${PROJ}
-APP_ENV=local
-APP_KEY=
-APP_DEBUG=true
-APP_URL=http://${SERVER_NAME}
-
-LOG_CHANNEL=stack
-LOG_LEVEL=debug
-
-DB_CONNECTION=mysql
-DB_HOST=127.0.0.1
-DB_PORT=3306
-DB_DATABASE=${DB_NAME}
-DB_USERNAME=${DB_USER}
-DB_PASSWORD=${DB_PASS}
-
-BROADCAST_CONNECTION=log
-CACHE_STORE=file
-FILESYSTEM_DISK=local
-QUEUE_CONNECTION=database
-SESSION_DRIVER=file
-SESSION_LIFETIME=120
-
-REDIS_HOST=127.0.0.1
-REDIS_PASSWORD=null
-REDIS_PORT=6379
-
-MAIL_MAILER=log
-MAIL_HOST=127.0.0.1
-MAIL_PORT=2525
-MAIL_USERNAME=null
-MAIL_PASSWORD=null
-MAIL_ENCRYPTION=null
-MAIL_FROM_ADDRESS="hello@example.com"
-MAIL_FROM_NAME="\${APP_NAME}"
-
-VITE_APP_NAME="\${APP_NAME}"
-EOF
-
-        info "Created .env"
-
-    fi
+    warn ".env already exists."
 
 else
 
-    # Vemto may create its own .env.
-    # We create one only if it doesn't exist.
-
-    if [[ ! -f "$ENV_FILE" ]]; then
-
-        cat > "$ENV_FILE" <<EOF
+    cat > "$ENV_FILE" <<EOF
 APP_NAME=${PROJ}
 APP_ENV=local
 APP_KEY=
@@ -983,8 +923,8 @@ DB_CONNECTION=mysql
 DB_HOST=127.0.0.1
 DB_PORT=3306
 DB_DATABASE=${DB_NAME}
-DB_USERNAME=${DB_USER}
-DB_PASSWORD=${DB_PASS}
+DB_USERNAME=${DB_USERNAME}
+DB_PASSWORD=${DB_PASSWORD}
 
 BROADCAST_CONNECTION=log
 CACHE_STORE=file
@@ -1009,28 +949,104 @@ MAIL_FROM_NAME="\${APP_NAME}"
 VITE_APP_NAME="\${APP_NAME}"
 EOF
 
-        info "Created .env for Vemto."
+    chmod 640 "$ENV_FILE"
 
-    fi
+    info ".env created."
+fi
+
+# ============================================================================
+# OWNERSHIP / BASIC PERMISSIONS
+# ============================================================================
+
+section "PROJECT PERMISSIONS"
+
+# Normal project ownership:
+#
+#   developer:www-data
+#
+# This allows the developer to work normally while www-data can
+# access the application.
+
+chown -R "$OWNER:$WEB_GROUP" "$PROJECT_DIR"
+
+# Normal application files/directories.
+find "$PROJECT_DIR" -type d -exec chmod 755 {} \;
+find "$PROJECT_DIR" -type f -exec chmod 644 {} \;
+
+# Laravel writable directories.
+chmod -R 775 "$PROJECT_DIR/storage"
+chmod -R 775 "$PROJECT_DIR/bootstrap/cache"
+
+# .env contains credentials.
+chmod 640 "$ENV_FILE"
+
+# ============================================================================
+# ACL TRAVERSAL FOR /home/... PROJECTS
+# ============================================================================
+
+section "ACL / WEB SERVER ACCESS"
+
+grant_traversal() {
+
+    local TARGET="$1"
+    local CURRENT="/"
+
+    IFS='/' read -ra PARTS <<< "${TARGET#/}"
+
+    for PART in "${PARTS[@]}"; do
+
+        [[ -z "$PART" ]] && continue
+
+        CURRENT="${CURRENT%/}/${PART}"
+
+        if [[ -d "$CURRENT" ]]; then
+
+            setfacl -m "u:${WEB_USER}:--x" "$CURRENT" 2>/dev/null || true
+
+        fi
+    done
+}
+
+# Apache must be able to traverse the complete path.
+grant_traversal "$PROJECT_DIR"
+
+# Laravel writable directories.
+setfacl -R -m "u:${WEB_USER}:rwX" "$PROJECT_DIR/storage"
+setfacl -R -m "u:${WEB_USER}:rwX" "$PROJECT_DIR/bootstrap/cache"
+
+# Default ACLs so newly-created files/directories remain writable by Apache.
+setfacl -R -d -m "u:${WEB_USER}:rwX" "$PROJECT_DIR/storage"
+setfacl -R -d -m "u:${WEB_USER}:rwX" "$PROJECT_DIR/bootstrap/cache"
+
+info "ACL permissions configured."
+
+# ============================================================================
+# LARAVEL APP KEY
+# ============================================================================
+
+if [[ "$PROJECT_TYPE" == "1" ]] && [[ -f "$PROJECT_DIR/artisan" ]]; then
+
+    section "LARAVEL APPLICATION KEY"
+
+    info "Generating application key using PHP $PHP_VER..."
+
+    su - "$OWNER" -c \
+        "cd '$PROJECT_DIR' && '$PHP_BIN' artisan key:generate --force"
+
+    info "Application key generated."
+
+else
+
+    info "Skipping application key generation."
+    info "Run it after Vemto finishes generating the Laravel application."
 
 fi
 
-# ============================================================
-# APACHE
-# ============================================================
+# ============================================================================
+# APACHE VIRTUALHOST
+# ============================================================================
 
-title "APACHE"
-
-command -v apache2 >/dev/null 2>&1 || die "Apache2 is not installed."
-
-for MODULE in rewrite proxy proxy_fcgi setenvif; do
-
-    if ! a2query -m "$MODULE" >/dev/null 2>&1; then
-        a2enmod "$MODULE" >/dev/null
-        info "Enabled Apache module: ${MODULE}"
-    fi
-
-done
+section "APACHE VIRTUALHOST"
 
 VHOST_FILE="${APACHE_SITES_AVAILABLE}/${PROJ}.test.conf"
 
@@ -1038,7 +1054,6 @@ cat > "$VHOST_FILE" <<EOF
 <VirtualHost *:80>
 
     ServerName ${SERVER_NAME}
-    ServerAlias www.${SERVER_NAME}
 
     DocumentRoot ${PROJECT_DIR}/public
 
@@ -1046,349 +1061,332 @@ cat > "$VHOST_FILE" <<EOF
         Options FollowSymLinks
         AllowOverride All
         Require all granted
+
+        DirectoryIndex index.php index.html
     </Directory>
 
-    <FilesMatch \.php$>
-        SetHandler "proxy:unix:/run/php/php${PHP_VER}-fpm.sock|fcgi://localhost/"
+    <FilesMatch "\.php$">
+        SetHandler "proxy:unix:${PHP_FPM_SOCKET}|fcgi://localhost/"
     </FilesMatch>
 
-    <Directory ${PROJECT_DIR}>
-        Require all granted
-    </Directory>
+    # Prevent direct access to hidden files such as .env
+    <FilesMatch "^\.">
+        Require all denied
+    </FilesMatch>
 
-    ErrorLog \${APACHE_LOG_DIR}/${PROJ}_test_error.log
-    CustomLog \${APACHE_LOG_DIR}/${PROJ}_test_access.log combined
+    ErrorLog \${APACHE_LOG_DIR}/${PROJ}_error.log
+    CustomLog \${APACHE_LOG_DIR}/${PROJ}_access.log combined
 
 </VirtualHost>
 EOF
 
-info "Created Apache VirtualHost:"
-echo "  ${VHOST_FILE}"
+info "VirtualHost created:"
+info "$VHOST_FILE"
 
-# ============================================================
-# /ETC/HOSTS
-# ============================================================
+# ============================================================================
+# HOSTS FILE
+# ============================================================================
 
-if ! grep -qE "^[[:space:]]*127\.0\.0\.1[[:space:]]+${SERVER_NAME}([[:space:]]|$)" "$HOSTS_FILE"; then
+section "LOCAL DOMAIN"
+
+if grep -qE "^[[:space:]]*127\.0\.0\.1[[:space:]]+${SERVER_NAME}([[:space:]]|$)" "$HOSTS_FILE"; then
+
+    info "$SERVER_NAME already exists in /etc/hosts."
+
+else
 
     echo "127.0.0.1    ${SERVER_NAME}" >> "$HOSTS_FILE"
 
-    info "Added ${SERVER_NAME} to /etc/hosts."
-
-else
-
-    info "${SERVER_NAME} already exists in /etc/hosts."
+    info "Added $SERVER_NAME to /etc/hosts."
 
 fi
 
-# ============================================================
-# ENABLE SITE
-# ============================================================
+# ============================================================================
+# APACHE MODULES
+# ============================================================================
 
-a2ensite "${PROJ}.test.conf" >/dev/null 2>&1 || true
+section "APACHE MODULES"
 
-# ============================================================
-# PHP-FPM
-# ============================================================
+for MOD in rewrite proxy proxy_fcgi setenvif; do
 
-systemctl enable --now "php${PHP_VER}-fpm"
+    if ! a2query -m "$MOD" >/dev/null 2>&1; then
 
-SOCKET="/run/php/php${PHP_VER}-fpm.sock"
+        info "Enabling Apache module: $MOD"
 
-if [[ ! -S "$SOCKET" ]]; then
-    sleep 2
-fi
-
-if [[ ! -S "$SOCKET" ]]; then
-    die "PHP-FPM socket not found: ${SOCKET}"
-fi
-
-info "PHP-FPM socket verified: ${SOCKET}"
-
-# ============================================================
-# PERMISSIONS
-# ============================================================
-
-title "PERMISSIONS"
-
-# ------------------------------------------------------------
-# Ownership
-# ------------------------------------------------------------
-
-chown -R "${OWNER}:www-data" "$PROJECT_DIR"
-
-# ------------------------------------------------------------
-# Base project permissions
-# ------------------------------------------------------------
-
-find "$PROJECT_DIR" -type d -exec chmod 755 {} \;
-find "$PROJECT_DIR" -type f -exec chmod 644 {} \;
-
-# ------------------------------------------------------------
-# Laravel writable directories
-# ------------------------------------------------------------
-
-chmod -R 775 \
-    "$PROJECT_DIR/storage" \
-    "$PROJECT_DIR/bootstrap/cache"
-
-chown -R "${OWNER}:www-data" \
-    "$PROJECT_DIR/storage" \
-    "$PROJECT_DIR/bootstrap/cache"
-
-# ------------------------------------------------------------
-# ACL: Apache traversal
-# ------------------------------------------------------------
-
-if command -v setfacl >/dev/null 2>&1; then
-
-    # Allow www-data to traverse the parent directory.
-    setfacl -m u:www-data:--x "$OWNER_HOME"
-
-    # Allow www-data to traverse the selected base directory.
-    setfacl -m u:www-data:--x "$BASE_DIR"
-
-    # Project traversal.
-    setfacl -m u:www-data:--x "$PROJECT_DIR"
-
-    # Laravel writable directories.
-    setfacl -R -m u:www-data:rwX \
-        "$PROJECT_DIR/storage" \
-        "$PROJECT_DIR/bootstrap/cache"
-
-    # Default ACLs so newly created files/directories inherit access.
-    setfacl -R -d -m u:www-data:rwX \
-        "$PROJECT_DIR/storage" \
-        "$PROJECT_DIR/bootstrap/cache"
-
-    info "ACL permissions configured for www-data."
-
-else
-
-    warn "setfacl not found. Installing acl..."
-
-    apt-get install -y acl
-
-    setfacl -m u:www-data:--x "$OWNER_HOME"
-    setfacl -m u:www-data:--x "$BASE_DIR"
-    setfacl -m u:www-data:--x "$PROJECT_DIR"
-
-    setfacl -R -m u:www-data:rwX \
-        "$PROJECT_DIR/storage" \
-        "$PROJECT_DIR/bootstrap/cache"
-
-    setfacl -R -d -m u:www-data:rwX \
-        "$PROJECT_DIR/storage" \
-        "$PROJECT_DIR/bootstrap/cache"
-
-fi
-
-info "Permissions configured."
-
-# ============================================================
-# LARAVEL KEY
-# ============================================================
-
-if [[ -f "$PROJECT_DIR/artisan" ]]; then
-
-    title "LARAVEL CONFIGURATION"
-
-    if grep -q "^APP_KEY=$" "$ENV_FILE"; then
-
-        info "Generating application key..."
-
-        su - "$OWNER" -c \
-            "cd '$PROJECT_DIR' && '$PHP_BIN' artisan key:generate --force"
+        a2enmod "$MOD" >/dev/null
 
     else
 
-        info "Application key already exists."
+        info "Apache module already enabled: $MOD"
 
     fi
 
-    # Clear Laravel configuration cache.
-    su - "$OWNER" -c \
-        "cd '$PROJECT_DIR' && '$PHP_BIN' artisan config:clear" || true
+done
+
+# ============================================================================
+# ENABLE SITE
+# ============================================================================
+
+if ! a2query -s "${PROJ}.test" >/dev/null 2>&1; then
+
+    a2ensite "${PROJ}.test.conf" >/dev/null
+
+    info "Enabled site: ${PROJ}.test"
+
+else
+
+    info "Site already enabled: ${PROJ}.test"
 
 fi
 
-# ============================================================
-# COMPOSER AUTOLOAD
-# ============================================================
+# ============================================================================
+# APACHE CONFIG TEST
+# ============================================================================
 
-if [[ "$PROJECT_MODE" == "normal" && -f "$PROJECT_DIR/composer.json" ]]; then
+section "APACHE CONFIGURATION TEST"
 
-    info "Running Composer dump-autoload..."
+APACHE_TEST_OUTPUT="$(apache2ctl configtest 2>&1)" || {
+    echo
+    echo "---------------- APACHE ERROR ----------------"
+    echo "$APACHE_TEST_OUTPUT"
+    echo "-----------------------------------------------"
+    echo
+    error "Apache configuration test FAILED."
+    error "Apache was NOT reloaded."
+    exit 1
+}
 
-    su - "$OWNER" -c \
-        "cd '$PROJECT_DIR' && '$PHP_BIN' '$COMPOSER_BIN' dump-autoload"
+echo "$APACHE_TEST_OUTPUT"
 
-fi
+info "Apache configuration: OK"
 
-# ============================================================
-# DATABASE MIGRATION
-# ============================================================
+# ============================================================================
+# DATABASE CONNECTION TEST FROM LARAVEL
+# ============================================================================
 
-if [[ "$PROJECT_MODE" == "normal" ]]; then
+if [[ "$PROJECT_TYPE" == "1" ]] && [[ -f "$PROJECT_DIR/artisan" ]]; then
 
-    title "DATABASE MIGRATION"
+    section "LARAVEL DATABASE TEST"
 
-    read -rp \
-    "Run 'php artisan migrate --seed' now? [Y/n]: " RUN_MIGRATE
+    if su - "$OWNER" -c \
+        "cd '$PROJECT_DIR' && '$PHP_BIN' artisan tinker --execute='DB::connection()->getPdo(); echo \"Database connection OK\\n\";'" \
+        2>&1; then
 
-    RUN_MIGRATE="${RUN_MIGRATE:-Y}"
+        info "Laravel database connection: OK"
 
-    if [[ "$RUN_MIGRATE" =~ ^[Yy]$ ]]; then
+    else
 
-        su - "$OWNER" -c \
-            "cd '$PROJECT_DIR' && '$PHP_BIN' artisan migrate --seed"
+        warn "Laravel database connection test failed."
+
+        warn "The database and .env were created, but Laravel could not connect."
+        warn "Check the database credentials before running migrations."
 
     fi
 
 else
 
-    title "VEMTO"
-
-    echo "The Vemto project is prepared."
-    echo
-    echo "Project directory:"
-    echo "  ${PROJECT_DIR}"
-    echo
-    echo "Selected PHP:"
-    echo "  PHP ${PHP_VER}"
-    echo
-    echo "Selected Laravel:"
-    echo "  Laravel ${LARAVEL_VER}"
-    echo
-    echo "Vemto should generate the Laravel application into:"
-    echo "  ${PROJECT_DIR}"
-    echo
+    info "Laravel database test deferred until Vemto generation is complete."
 
 fi
 
-# ============================================================
-# APACHE TEST
-# ============================================================
+# ============================================================================
+# LARAVEL VERSION CHECK
+# ============================================================================
 
-title "APACHE FINALIZATION"
+LARAVEL_VERSION="N/A"
 
-if ! apache2ctl configtest; then
+if [[ -f "$PROJECT_DIR/artisan" ]]; then
 
-    error "Apache configuration test failed."
+    LARAVEL_VERSION="$(
+        su - "$OWNER" -c \
+            "cd '$PROJECT_DIR' && '$PHP_BIN' artisan --version" \
+            2>/dev/null || echo "Unable to determine"
+    )"
 
-    error "VirtualHost:"
-    error "  ${VHOST_FILE}"
+    info "Laravel version: $LARAVEL_VERSION"
+
+fi
+
+# ============================================================================
+# RELOAD APACHE
+# ============================================================================
+
+section "RELOADING APACHE"
+
+if ! systemctl reload apache2; then
+
+    error "Apache reload failed."
+
+    systemctl status apache2 --no-pager || true
 
     exit 1
 
 fi
 
-systemctl reload apache2
-
 info "Apache reloaded successfully."
 
-# ============================================================
-# FINAL PERMISSIONS
-# ============================================================
+# ============================================================================
+# FINAL VERIFICATION
+# ============================================================================
 
-chown -R "${OWNER}:www-data" "$PROJECT_DIR"
-
-find "$PROJECT_DIR" -type d -exec chmod 755 {} \;
-find "$PROJECT_DIR" -type f -exec chmod 644 {} \;
-
-chmod -R 775 \
-    "$PROJECT_DIR/storage" \
-    "$PROJECT_DIR/bootstrap/cache"
-
-setfacl -m u:www-data:--x "$OWNER_HOME"
-setfacl -m u:www-data:--x "$BASE_DIR"
-setfacl -m u:www-data:--x "$PROJECT_DIR"
-
-setfacl -R -m u:www-data:rwX \
-    "$PROJECT_DIR/storage" \
-    "$PROJECT_DIR/bootstrap/cache"
-
-setfacl -R -d -m u:www-data:rwX \
-    "$PROJECT_DIR/storage" \
-    "$PROJECT_DIR/bootstrap/cache"
-
-# ============================================================
-# FINAL SUMMARY
-# ============================================================
-
-title "PROJECT CREATED SUCCESSFULLY"
-
-echo "Project type:"
-echo "  ${PROJECT_MODE}"
-
-echo
-echo "Project:"
-echo "  ${PROJ}"
-
-echo
-echo "Directory:"
-echo "  ${PROJECT_DIR}"
-
-echo
-echo "URL:"
-echo "  http://${SERVER_NAME}"
-
-echo
-echo "PHP:"
-echo "  PHP ${PHP_VER}"
-
-echo
-echo "PHP-FPM:"
-echo "  /run/php/php${PHP_VER}-fpm.sock"
-
-echo
-echo "Laravel:"
-echo "  Laravel ${LARAVEL_VER}"
-
-echo
-echo "Database:"
-echo "  ${DB_NAME}"
-
-echo
-echo "Database user:"
-echo "  ${DB_USER}"
-
-echo
-echo "Apache:"
-echo "  ${VHOST_FILE}"
+section "FINAL VERIFICATION"
 
 echo
 
-if [[ "$PROJECT_MODE" == "normal" ]]; then
+echo "Project"
+echo "-------"
+echo "Name:             $PROJ"
+echo "Directory:        $PROJECT_DIR"
+echo "URL:              http://${SERVER_NAME}"
+echo "Type:             $([[ "$PROJECT_TYPE" == "1" ]] && echo "Normal Laravel" || echo "Vemto")"
 
-    echo "Next steps:"
-    echo
-    echo "  cd ${PROJECT_DIR}"
-    echo "  ${PHP_BIN} artisan serve"
-    echo
-    echo "Or simply open:"
-    echo "  http://${SERVER_NAME}"
+echo
+echo "PHP"
+echo "---"
+echo "Selected PHP:     PHP $PHP_VER"
+echo "PHP binary:       $PHP_BIN"
+echo "PHP version:"
+"$PHP_BIN" -v | head -1
+
+echo
+echo "PHP-FPM"
+echo "-------"
+echo "Service:          $PHP_FPM_SERVICE"
+
+if systemctl is-active --quiet "$PHP_FPM_SERVICE"; then
+    echo "Status:           ACTIVE"
+else
+    echo "Status:           FAILED"
+fi
+
+echo "Socket:           $PHP_FPM_SOCKET"
+
+if [[ -S "$PHP_FPM_SOCKET" ]]; then
+    echo "Socket status:    OK"
+else
+    echo "Socket status:    MISSING"
+fi
+
+echo
+echo "Apache"
+echo "------"
+
+if apache2ctl configtest 2>&1; then
+    echo "Configuration:    OK"
+else
+    echo "Configuration:    FAILED"
+fi
+
+if systemctl is-active --quiet apache2; then
+    echo "Service:          ACTIVE"
+else
+    echo "Service:          FAILED"
+fi
+
+echo
+echo "Database"
+echo "--------"
+echo "Database:         $DB_NAME"
+echo "Username:         $DB_USERNAME"
+
+if [[ "$PROJECT_TYPE" == "1" ]] && [[ -f "$PROJECT_DIR/artisan" ]]; then
+
+    if su - "$OWNER" -c \
+        "cd '$PROJECT_DIR' && '$PHP_BIN' artisan migrate:status >/dev/null 2>&1"; then
+
+        echo "Laravel DB:       OK"
+
+    else
+
+        echo "Laravel DB:       CHECK REQUIRED"
+
+    fi
 
 else
 
-    echo "Next steps:"
-    echo
-    echo "  1. Open Vemto."
-    echo "  2. Generate the project into:"
-    echo "     ${PROJECT_DIR}"
-    echo "  3. Make sure Vemto uses:"
-    echo "     PHP ${PHP_VER}"
-    echo "  4. After generation:"
-    echo
-    echo "     cd ${PROJECT_DIR}"
-    echo "     ${PHP_BIN} artisan migrate:fresh --seed"
-    echo
-    echo "  5. Open:"
-    echo "     http://${SERVER_NAME}"
+    echo "Laravel DB:       Deferred until Vemto generation"
 
 fi
 
 echo
-echo "============================================================"
-echo " DONE"
-echo "============================================================"
+echo "Permissions"
+echo "-----------"
+echo "Owner:            $(stat -c '%U' "$PROJECT_DIR")"
+echo "Group:            $(stat -c '%G' "$PROJECT_DIR")"
+echo "storage:          $(stat -c '%A' "$PROJECT_DIR/storage")"
+echo "bootstrap/cache:  $(stat -c '%A' "$PROJECT_DIR/bootstrap/cache")"
+
+echo
+echo "Laravel"
+echo "-------"
+echo "Version:          $LARAVEL_VERSION"
+
+# ============================================================================
+# FINAL INSTRUCTIONS
+# ============================================================================
+
+section "PROJECT READY"
+
+echo
+echo "URL:"
+echo "  http://${SERVER_NAME}"
+echo
+
+echo "Directory:"
+echo "  ${PROJECT_DIR}"
+echo
+
+echo "PHP:"
+echo "  PHP ${PHP_VER}"
+echo
+
+echo "Laravel:"
+echo "  ${LARAVEL_VERSION}"
+echo
+
+echo "Database:"
+echo "  ${DB_NAME}"
+echo
+
+if [[ "$PROJECT_TYPE" == "1" ]]; then
+
+    echo "Next steps:"
+    echo
+    echo "  cd ${PROJECT_DIR}"
+    echo
+    echo "  ${PHP_BIN} artisan migrate"
+    echo
+    echo "  npm install"
+    echo "  npm run dev"
+    echo
+
+else
+
+    echo "Vemto next steps:"
+    echo
+    echo "  1. Open Vemto."
+    echo "  2. Select this project directory:"
+    echo
+    echo "       ${PROJECT_DIR}"
+    echo
+    echo "  3. Let Vemto generate the Laravel application."
+    echo "  4. After generation run:"
+    echo
+    echo "       cd ${PROJECT_DIR}"
+    echo "       ${PHP_BIN} artisan key:generate"
+    echo "       ${PHP_BIN} artisan migrate:fresh --seed"
+    echo
+
+fi
+
+echo
+echo "Apache configuration:"
+echo "  ${VHOST_FILE}"
+echo
+
+echo "PHP-FPM socket:"
+echo "  ${PHP_FPM_SOCKET}"
+echo
+
+info "Everything completed successfully."
+```
