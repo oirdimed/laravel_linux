@@ -619,7 +619,7 @@ A dry-run mode is provided for testing what the script intends to do without app
 
 Example:
 
-```bash
+```
 sudo ./add-laravel-project.sh --dry-run
 ```
 
@@ -642,7 +642,7 @@ For automated environments, the script can support non-interactive execution.
 
 Example:
 
-```bash
+```
 sudo ./add-laravel-project.sh --non-interactive
 ```
 
@@ -679,13 +679,13 @@ Sensitive information such as database passwords should **never** be written to 
 
 Clone the repository:
 
-```bash
+```
 git clone https://github.com/oirdimed/laravel_linux.git
 ```
 
 Enter the directory:
 
-```bash
+```
 cd laravel_linux
 ```
 
@@ -693,7 +693,7 @@ cd laravel_linux
 
 ## 2. Make the script executable
 
-```bash
+```
 chmod +x add-laravel-project.sh
 ```
 
@@ -703,14 +703,14 @@ chmod +x add-laravel-project.sh
 
 Optional, but convenient:
 
-```bash
+```
 sudo cp add-laravel-project.sh /usr/local/bin/add-laravel-project
 sudo chmod 755 /usr/local/bin/add-laravel-project
 ```
 
 You can then run it from anywhere:
 
-```bash
+```
 sudo add-laravel-project
 ```
 
@@ -720,7 +720,7 @@ sudo add-laravel-project
 
 The normal interactive command is:
 
-```bash
+```
 sudo add-laravel-project
 ```
 
